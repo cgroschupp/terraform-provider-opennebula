@@ -72,7 +72,7 @@ func datasourceOpennebulaHookRead(ctx context.Context, d *schema.ResourceData, m
 
 	d.SetId(strconv.FormatInt(int64(hook.ID), 10))
 
-	setHookResourceData(d, hook)
+	setHookResourceData(d, meta, hook)
 
 	tags := hookTemplateTags(hook.Template.Template)
 	if err := d.Set("tags", tags); err != nil {

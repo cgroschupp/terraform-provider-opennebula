@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/dynamic"
@@ -34,6 +35,18 @@ var hookReservedTemplateKeys = map[string]struct{}{
 	"STATE":           {},
 	"LCM_STATE":       {},
 	"ON":              {},
+}
+
+var hookShortcuts = map[string]struct {
+	State    string
+	LCMState string
+}{
+	"PROLOG":   {State: "ACTIVE", LCMState: "PROLOG"},
+	"RUNNING":  {State: "ACTIVE", LCMState: "RUNNING"},
+	"SHUTDOWN": {State: "ACTIVE", LCMState: "EPILOG"},
+	"STOP":     {State: "STOPPED", LCMState: "LCM_INIT"},
+	"DONE":     {State: "DONE", LCMState: "LCM_INIT"},
+	"UNKNOWN":  {State: "ACTIVE", LCMState: "UNKNOWN"},
 }
 
 func resourceOpennebulaHook() *schema.Resource {
@@ -64,16 +77,11 @@ func hookSchema(dataSource bool) map[string]*schema.Schema {
 		Description: "Name of the hook",
 	}
 	typeSchema := &schema.Schema{
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Type of the hook: api or state",
-		ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-			value := strings.ToLower(v.(string))
-			if !contains(value, hookTypes) {
-				errors = append(errors, fmt.Errorf("%q must be one of: %s", k, strings.Join(hookTypes, ", ")))
-			}
-			return
-		},
+		Type:         schema.TypeString,
+		Required:     true,
+		Description:  "Type of the hook: api or state",
+		ValidateFunc: validation.StringInSlice(hookTypes, true),
+		ForceNew:     true,
 	}
 	commandSchema := &schema.Schema{
 		Type:        schema.TypeString,
@@ -122,17 +130,11 @@ func hookSchema(dataSource bool) map[string]*schema.Schema {
 			Description: "API call that triggers an api hook, for example one.user.allocate",
 		},
 		"resource": {
-			Type:        schema.TypeString,
-			Optional:    !dataSource,
-			Computed:    dataSource,
-			Description: "Resource type for state hooks: IMAGE, HOST, or VM",
-			ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-				value := strings.ToUpper(v.(string))
-				if value != "" && !contains(value, hookResources) {
-					errors = append(errors, fmt.Errorf("%q must be one of: %s", k, strings.Join(hookResources, ", ")))
-				}
-				return
-			},
+			Type:         schema.TypeString,
+			Optional:     !dataSource,
+			Computed:     dataSource,
+			Description:  "Resource type for state hooks: IMAGE, HOST, or VM",
+			ValidateFunc: validation.StringInSlice(append([]string{""}, hookResources...), true),
 		},
 		"remote": {
 			Type:        schema.TypeBool,
@@ -144,27 +146,21 @@ func hookSchema(dataSource bool) map[string]*schema.Schema {
 		"state": {
 			Type:        schema.TypeString,
 			Optional:    !dataSource,
-			Computed:    dataSource,
+			Computed:    true,
 			Description: "State that triggers a state hook",
 		},
 		"lcm_state": {
 			Type:        schema.TypeString,
 			Optional:    !dataSource,
-			Computed:    dataSource,
+			Computed:    true,
 			Description: "LCM state that triggers a VM state hook when on is CUSTOM",
 		},
 		"on": {
-			Type:        schema.TypeString,
-			Optional:    !dataSource,
-			Computed:    dataSource,
-			Description: "Shortcut for common VM state hook transitions: PROLOG, RUNNING, SHUTDOWN, STOP, DONE, UNKNOWN, CUSTOM",
-			ValidateFunc: func(v interface{}, k string) (ws []string, errors []error) {
-				value := strings.ToUpper(v.(string))
-				if value != "" && !contains(value, hookVMOns) {
-					errors = append(errors, fmt.Errorf("%q must be one of: %s", k, strings.Join(hookVMOns, ", ")))
-				}
-				return
-			},
+			Type:         schema.TypeString,
+			Optional:     !dataSource,
+			Computed:     dataSource,
+			Description:  "Shortcut for common VM state hook transitions: PROLOG, RUNNING, SHUTDOWN, STOP, DONE, UNKNOWN, CUSTOM",
+			ValidateFunc: validation.StringInSlice(append([]string{""}, hookVMOns...), true),
 		},
 		"tags":         tagsSchema(),
 		"default_tags": defaultTagsSchemaComputed(),
@@ -173,6 +169,13 @@ func hookSchema(dataSource bool) map[string]*schema.Schema {
 
 	if dataSource {
 		s["tags"].Computed = true
+
+		for _, field := range s {
+			if field.Computed && !field.Optional && !field.Required {
+				field.ValidateDiagFunc = nil
+				field.ValidateFunc = nil
+			}
+		}
 	}
 
 	if idSchema != nil {
@@ -231,18 +234,58 @@ func customizeHookDiff(ctx context.Context, diff *schema.ResourceDiff, meta inte
 		}
 		switch resource {
 		case "VM":
+
+			if !diff.NewValueKnown("on") { // Could be derived from previous expression
+				return nil
+			}
+
 			on := strings.ToUpper(diff.Get("on").(string))
-			if on == "" {
-				return fmt.Errorf("on is required for VM state hooks")
+
+			rawConfig := diff.GetRawConfig()
+			if rawConfig.IsNull() || !rawConfig.IsKnown() {
+				return nil
 			}
+
 			if on == "CUSTOM" {
-				if diff.Get("state").(string) == "" {
-					return fmt.Errorf("state is required for VM state hooks when on is CUSTOM")
+				for _, attr := range []string{"state", "lcm_state"} {
+					value := rawConfig.GetAttr(attr)
+
+					if value.IsNull() {
+						return fmt.Errorf("%s is required when on is CUSTOM", attr)
+					}
+
+					if value.IsKnown() && value.AsString() == "" {
+						return fmt.Errorf("%s cannot be empty when on is CUSTOM", attr)
+
+					}
 				}
-				if diff.Get("lcm_state").(string) == "" {
-					return fmt.Errorf("lcm_state is required for VM state hooks when on is CUSTOM")
+
+			} else {
+
+				for _, attr := range []string{"state", "lcm_state"} {
+					if !rawConfig.GetAttr(attr).IsNull() {
+						return fmt.Errorf(
+							"%s cannot be configured when on is %q; use on = CUSTOM to specify states",
+							attr, on,
+						)
+					}
+				}
+				shortcut, ok := hookShortcuts[on]
+
+				if !ok {
+					return fmt.Errorf("unsupported VM hook shortcut %q", on)
+
+				}
+
+				if err := diff.SetNew("state", shortcut.State); err != nil {
+					return fmt.Errorf("error setting hook state: %w", err)
+				}
+
+				if err := diff.SetNew("lcm_state", shortcut.LCMState); err != nil {
+					return fmt.Errorf("error setting hook lcm_state: %w", err)
 				}
 			}
+
 		case "HOST", "IMAGE":
 			if diff.Get("state").(string) == "" {
 				return fmt.Errorf("state is required for %s state hooks", resource)
@@ -474,7 +517,14 @@ func setHookResourceData(d *schema.ResourceData, meta interface{}, hook *hookSc.
 	d.Set("remote", parseHookBool(getHookTemplateString(&hook.Template.Template, "REMOTE")))
 	setHookUpperString(d, &hook.Template.Template, "state", "STATE")
 	setHookUpperString(d, &hook.Template.Template, "lcm_state", "LCM_STATE")
-	setHookUpperString(d, &hook.Template.Template, "on", "ON")
+
+	if hookType == "state" && d.Get("resource").(string) == "VM" {
+		if d.Get("on").(string) == "" {
+			d.Set("on", "CUSTOM")
+		}
+	} else {
+		d.Set("on", "")
+	}
 
 	diags = append(diags, flattenTemplateTags(d, meta, &hook.Template.Template)...)
 	return diags
